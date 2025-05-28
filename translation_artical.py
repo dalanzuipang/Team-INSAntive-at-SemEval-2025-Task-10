@@ -8,6 +8,7 @@ Text Translation Tool for Long Articles
 Handles oversized documents by processing them in segments
 """
 
+
 class TextTranslator:
     def __init__(self, api_key: Optional[str] = None):
         """
