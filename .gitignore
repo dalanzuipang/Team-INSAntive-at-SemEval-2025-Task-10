@@ -1,0 +1,138 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+
+# IDE and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment Variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# API Keys and Secrets
+config.ini
+secrets.yaml
+api_keys.txt
+
+# Model Files and Training Outputs
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.pkl
+*.pickle
+
+# Training and Logging
+lightning_logs/
+tensorboard_logs/
+logs/
+wandb/
+*.log
+checkpoints/
+best-checkpoint*
+
+# Data Directories
+data/
+datasets/
+raw-documents/
+classified_by_top_label/
+sub_label_models/
+training_data_2/
+EN/
+Folder2/
+
+# Translation and Processing Outputs
+translated/
+organized/
+processed/
+failed_files/
+output/
+
+# Cache Directories
+.cache/
+.transformers_cache/
+.torch/
+.huggingface/
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Temporary Files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Large Files (Git LFS should be used instead)
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# Documentation Build
+docs/_build/
+site/
+
+# Coverage Reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+
+# pytest
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
