@@ -1,297 +1,377 @@
-import pandas as pd
 import os
-import torch
-import numpy as np
-import pytorch_lightning as pl
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger
-from datetime import datetime
-from sklearn.preprocessing import MultiLabelBinarizer
-from typing import List, Tuple
+import csv
 from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+import logging
 
 
-class PersTecData(torch.utils.data.Dataset):
+class TextDataOrganizer:
     """
-    Dataset class for multi-label text classification.
-    """
+    Organizes text files into hierarchical classification structure based on annotation files.
     
-    def __init__(self, data: pd.DataFrame, tokenizer: AutoTokenizer, binarizer: MultiLabelBinarizer, max_length: int):
-        """
-        Initialize the dataset.
-        
-        Args:
-            data: DataFrame containing text and labels
-            tokenizer: HuggingFace tokenizer
-            binarizer: MultiLabelBinarizer for label encoding
-            max_length: Maximum sequence length
-        """
-        self.data = data
-        self.tokenizer = tokenizer
-        self.binarizer = binarizer
-        self.labels = binarizer.transform(data['labels'])
-        self.encoded_data = tokenizer(
-            data['text'].astype(str).tolist(), 
-            padding="max_length", 
-            truncation=True, 
-            max_length=max_length
-        )
-
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Get item from dataset.
-        
-        Args:
-            index: Index of the item
-            
-        Returns:
-            Tuple of (input_ids, attention_mask, labels)
-        """
-        input_ids = torch.tensor(self.encoded_data['input_ids'][index])
-        attention_mask = torch.tensor(self.encoded_data['attention_mask'][index])
-        labels = torch.tensor(self.labels[index]).float()
-        return input_ids, attention_mask, labels
-
-    def __len__(self) -> int:
-        """Return dataset length."""
-        return len(self.data)
-
-
-class PLMClassifier(pl.LightningModule):
-    """
-    PyTorch Lightning module for multi-label classification.
-    """
-    
-    def __init__(self, model: AutoModelForSequenceClassification, learning_rate: float = 2e-5):
-        """
-        Initialize the classifier.
-        
-        Args:
-            model: Pre-trained transformer model
-            learning_rate: Learning rate for training
-        """
-        super(PLMClassifier, self).__init__()
-        self.model = model
-        self.learning_rate = learning_rate
-        self.criterion = nn.BCELoss()
-
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            
-        Returns:
-            Sigmoid activated logits
-        """
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        return torch.sigmoid(outputs.logits)
-
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """
-        Training step.
-        
-        Args:
-            batch: Training batch
-            batch_idx: Batch index
-            
-        Returns:
-            Training loss
-        """
-        input_ids, attention_mask, labels = batch
-        preds = self(input_ids, attention_mask)
-        loss = self.criterion(preds, labels)
-        self.log('train_loss', loss)
-        return loss
-
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        """Configure optimizer."""
-        return torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
-
-
-class MultiLabelTextClassifier:
-    """
-    Main class for multi-label text classification training.
+    This class processes annotation files containing top-level and sub-level labels,
+    then organizes text files into corresponding directory structures for training
+    hierarchical classification models.
     """
     
     def __init__(
-        self,
-        raw_documents_dir: str = 'EN/raw-documents',
-        annotations_file: str = 'EN/no_trans_ues_subtask-2-annotations.txt',
-        model_name: str = "bert-base-uncased",
-        max_length: int = 128,
-        learning_rate: float = 2e-5,
-        max_epochs: int = 30,
-        threshold: float = 0.2,
-        batch_size: int = 8,
-        output_model_path: str = "trained_model_no_trans.pth"
+        self, 
+        annotation_file: str,
+        text_dir: str,
+        output_root: str = "classified_by_top_label",
+        encoding: str = "utf-8"
     ):
         """
-        Initialize the classifier.
+        Initialize the TextDataOrganizer.
         
         Args:
-            raw_documents_dir: Directory containing text files
-            annotations_file: Path to annotations file
-            model_name: HuggingFace model name
-            max_length: Maximum sequence length
-            learning_rate: Learning rate for training
-            max_epochs: Maximum training epochs
-            threshold: Classification threshold (not used in training)
-            batch_size: Training batch size
-            output_model_path: Path to save the trained model
+            annotation_file: Path to the annotation file (TSV format)
+            text_dir: Directory containing the text files
+            output_root: Root directory for organized output
+            encoding: File encoding (default: utf-8)
         """
-        self.raw_documents_dir = raw_documents_dir
-        self.annotations_file = annotations_file
-        self.model_name = model_name
-        self.max_length = max_length
-        self.learning_rate = learning_rate
-        self.max_epochs = max_epochs
-        self.threshold = threshold
-        self.batch_size = batch_size
-        self.output_model_path = output_model_path
+        self.annotation_file = Path(annotation_file)
+        self.text_dir = Path(text_dir)
+        self.output_root = Path(output_root)
+        self.encoding = encoding
         
-        # Initialize components
-        self.binarizer = MultiLabelBinarizer()
-        self.tokenizer = None
-        self.classification_model = None
-        self.model = None
-        self.trainer = None
-        self.data_df = None
+        # Create output directory
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        
+        # Setup logging
+        self._setup_logging()
+        
+        # Dictionary to store top label -> [(article_id, sub_labels)] mapping
+        self.top_label_articles: Dict[str, List[Tuple[str, List[str]]]] = defaultdict(list)
+        
+        # Statistics
+        self.stats = {
+            'total_rows': 0,
+            'valid_rows': 0,
+            'files_processed': 0,
+            'files_not_found': 0,
+            'top_labels_created': 0
+        }
     
-    def load_model_and_tokenizer(self) -> Tuple[AutoTokenizer, AutoModelForSequenceClassification]:
+    def _setup_logging(self) -> None:
+        """Setup logging configuration."""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('text_organizer.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+    
+    def validate_inputs(self) -> bool:
         """
-        Load tokenizer and model.
+        Validate input files and directories exist.
         
         Returns:
-            Tuple of (tokenizer, model)
+            True if all inputs are valid, False otherwise
         """
-        tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
-        model = AutoModelForSequenceClassification.from_pretrained(
-            self.model_name, 
-            num_labels=len(self.binarizer.classes_)
-        )
-        return tokenizer, model
+        if not self.annotation_file.exists():
+            self.logger.error(f"Annotation file not found: {self.annotation_file}")
+            return False
+        
+        if not self.text_dir.exists():
+            self.logger.error(f"Text directory not found: {self.text_dir}")
+            return False
+        
+        if not self.text_dir.is_dir():
+            self.logger.error(f"Text path is not a directory: {self.text_dir}")
+            return False
+        
+        self.logger.info("Input validation passed")
+        return True
     
-    def load_data(self) -> None:
-        """Load and preprocess data."""
-        print("Loading data...")
+    def parse_labels(self, label_string: str) -> List[str]:
+        """
+        Parse semicolon-separated label string into a list.
         
-        # Read annotations file
-        annotations_df = pd.read_csv(
-            self.annotations_file, 
-            sep='\t', 
-            header=None, 
-            names=['article_id', 'labels']
-        )
-        annotations_df['labels'] = annotations_df['labels'].apply(lambda x: x.split(';'))
-        annotations_df['article_id'] = annotations_df['article_id'].str.replace('.txt', '', regex=False)
-
-        # Fit binarizer
-        self.binarizer.fit(annotations_df['labels'])
-
-        # Read articles
-        articles = []
-        for filename in os.listdir(self.raw_documents_dir):
-            if filename.endswith('.txt'):
-                article_id = filename.split('.')[0]
-                with open(os.path.join(self.raw_documents_dir, filename), 'r', encoding='utf-8') as file:
-                    article_text = file.read()
-                articles.append({'article_id': article_id, 'text': article_text})
-
-        # Convert to DataFrame
-        articles_df = pd.DataFrame(articles)
-
-        # Merge articles and annotations
-        self.data_df = pd.merge(articles_df, annotations_df, left_on='article_id', right_on='article_id', how='inner')
+        Args:
+            label_string: String containing labels separated by semicolons
+            
+        Returns:
+            List of cleaned label strings
+        """
+        if not label_string or not label_string.strip():
+            return []
         
-        print(f"Loaded {len(self.data_df)} articles")
+        return [label.strip() for label in label_string.split(";") if label.strip()]
     
-    def prepare_model(self) -> None:
-        """Prepare tokenizer and model."""
-        print("Preparing model...")
-        self.tokenizer, self.classification_model = self.load_model_and_tokenizer()
+    def read_text_file(self, file_path: Path) -> Optional[str]:
+        """
+        Read text content from file with error handling.
+        
+        Args:
+            file_path: Path to the text file
+            
+        Returns:
+            Text content or None if reading failed
+        """
+        try:
+            with open(file_path, "r", encoding=self.encoding) as f:
+                return f.read()
+        except Exception as e:
+            self.logger.error(f"Error reading file {file_path}: {e}")
+            return None
     
-    def create_dataset(self) -> None:
-        """Create dataset and data loader."""
-        print("Creating dataset...")
+    def write_text_file(self, file_path: Path, content: str) -> bool:
+        """
+        Write text content to file with error handling.
         
-        # Create dataset
-        dataset = PersTecData(self.data_df, self.tokenizer, self.binarizer, self.max_length)
-
-        # Use all data for training (as in original code)
-        self.train_dataset = dataset
-
-        # Create data loader
-        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
+        Args:
+            file_path: Path where to write the file
+            content: Text content to write
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Ensure parent directory exists
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(file_path, "w", encoding=self.encoding) as f:
+                f.write(content)
+            return True
+        except Exception as e:
+            self.logger.error(f"Error writing file {file_path}: {e}")
+            return False
     
-    def setup_training(self) -> None:
-        """Setup training components."""
-        print("Setting up training...")
+    def filter_sub_labels(self, sub_labels: List[str], top_label: str) -> List[str]:
+        """
+        Filter sub-labels that belong to the given top-level label.
         
-        # Initialize model
-        self.model = PLMClassifier(model=self.classification_model, learning_rate=self.learning_rate)
-
-        # Logger and Checkpoint
-        logger = CSVLogger("lightning_logs", name="model_logs")
-        checkpoint_callback = ModelCheckpoint(
-            dirpath='.', 
-            filename='best-checkpoint', 
-            save_top_k=1, 
-            monitor='train_loss', 
-            mode='min'
-        )
-
-        # Trainer
-        self.trainer = pl.Trainer(
-            max_epochs=self.max_epochs, 
-            callbacks=[checkpoint_callback], 
-            accelerator='cpu', 
-            logger=logger
-        )
+        Args:
+            sub_labels: List of all sub-labels
+            top_label: Top-level label to filter by
+            
+        Returns:
+            List of filtered sub-labels
+        """
+        return [sub for sub in sub_labels if sub.startswith(top_label)]
     
-    def train(self) -> None:
-        """Train the model."""
-        print("Starting training...")
+    def process_annotation_file(self) -> bool:
+        """
+        Process the annotation file and organize text files.
         
-        # Train model
-        self.trainer.fit(self.model, self.train_loader)
+        Returns:
+            True if processing was successful, False otherwise
+        """
+        if not self.validate_inputs():
+            return False
         
-        print("Training completed")
+        self.logger.info(f"Processing annotation file: {self.annotation_file}")
+        
+        try:
+            with open(self.annotation_file, "r", encoding=self.encoding) as f:
+                reader = csv.reader(f, delimiter="\t")
+                
+                for row_num, row in enumerate(reader, 1):
+                    self.stats['total_rows'] += 1
+                    
+                    # Skip invalid rows
+                    if len(row) < 3:
+                        self.logger.warning(f"Row {row_num}: Invalid format, skipping")
+                        continue
+                    
+                    filename, top_label_str, sub_label_str = row[0], row[1], row[2]
+                    
+                    # Parse labels
+                    top_labels = self.parse_labels(top_label_str)
+                    sub_labels = self.parse_labels(sub_label_str)
+                    
+                    if not top_labels:
+                        self.logger.warning(f"Row {row_num}: No valid top labels found")
+                        continue
+                    
+                    # Check if text file exists
+                    text_path = self.text_dir / filename
+                    if not text_path.is_file():
+                        self.logger.warning(f"Text file not found: {text_path}")
+                        self.stats['files_not_found'] += 1
+                        continue
+                    
+                    # Read article text
+                    article_text = self.read_text_file(text_path)
+                    if article_text is None:
+                        continue
+                    
+                    # Extract article ID (filename without extension)
+                    article_id = text_path.stem
+                    
+                    # Process each top label
+                    self._process_article_for_labels(
+                        article_id, article_text, top_labels, sub_labels
+                    )
+                    
+                    self.stats['valid_rows'] += 1
+                    self.stats['files_processed'] += 1
+                    
+                    if self.stats['files_processed'] % 100 == 0:
+                        self.logger.info(f"Processed {self.stats['files_processed']} files...")
+        
+        except Exception as e:
+            self.logger.error(f"Error processing annotation file: {e}")
+            return False
+        
+        return True
     
-    def save_model(self) -> None:
-        """Save the trained model."""
-        print(f"Saving model to {self.output_model_path}")
+    def _process_article_for_labels(
+        self, 
+        article_id: str, 
+        article_text: str, 
+        top_labels: List[str], 
+        sub_labels: List[str]
+    ) -> None:
+        """
+        Process a single article for all its top-level labels.
         
-        # Save trained model
-        torch.save(self.model.model.state_dict(), self.output_model_path)
-        
-        print(f"Training complete. Model saved as {self.output_model_path}")
+        Args:
+            article_id: Unique identifier for the article
+            article_text: Full text content of the article
+            top_labels: List of top-level labels for this article
+            sub_labels: List of sub-level labels for this article
+        """
+        for top_label in top_labels:
+            # Create directory for this top label
+            label_dir = self.output_root / top_label
+            label_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Write article file
+            article_file = label_dir / f"{article_id}.txt"
+            if not self.write_text_file(article_file, article_text):
+                continue
+            
+            # Filter sub-labels for this top label
+            filtered_sub_labels = self.filter_sub_labels(sub_labels, top_label)
+            
+            # Store mapping for later label file generation
+            self.top_label_articles[top_label].append((article_id, filtered_sub_labels))
     
-    def run_training_pipeline(self) -> None:
-        """Run the complete training pipeline."""
-        self.load_data()
-        self.prepare_model()
-        self.create_dataset()
-        self.setup_training()
-        self.train()
-        self.save_model()
+    def generate_label_files(self) -> bool:
+        """
+        Generate label files for each top-level category.
+        
+        Each label file contains:
+        - One line per article
+        - Tab-separated: article_id<TAB>sub_labels_separated_by_semicolon
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        self.logger.info("Generating label files...")
+        
+        try:
+            for top_label, articles_info in self.top_label_articles.items():
+                label_dir = self.output_root / top_label
+                label_file = label_dir / f"{top_label}_labels.txt"
+                
+                with open(label_file, "w", encoding=self.encoding) as f:
+                    for article_id, sub_labels in articles_info:
+                        # Format: article_id<TAB>sub_labels_joined_by_semicolon
+                        sub_labels_str = ";".join(sub_labels) if sub_labels else ""
+                        line = f"{article_id}\t{sub_labels_str}\n"
+                        f.write(line)
+                
+                self.stats['top_labels_created'] += 1
+                self.logger.info(f"Created label file for '{top_label}' with {len(articles_info)} articles")
+        
+        except Exception as e:
+            self.logger.error(f"Error generating label files: {e}")
+            return False
+        
+        return True
+    
+    def organize_data(self) -> bool:
+        """
+        Main method to organize all data.
+        
+        Returns:
+            True if organization was successful, False otherwise
+        """
+        self.logger.info("Starting data organization...")
+        
+        # Process annotation file and organize texts
+        if not self.process_annotation_file():
+            self.logger.error("Failed to process annotation file")
+            return False
+        
+        # Generate label files
+        if not self.generate_label_files():
+            self.logger.error("Failed to generate label files")
+            return False
+        
+        self._print_summary()
+        self.logger.info("Data organization completed successfully!")
+        return True
+    
+    def _print_summary(self) -> None:
+        """Print summary statistics."""
+        print("\n" + "="*50)
+        print("DATA ORGANIZATION SUMMARY")
+        print("="*50)
+        print(f"Total rows processed: {self.stats['total_rows']}")
+        print(f"Valid rows: {self.stats['valid_rows']}")
+        print(f"Files processed: {self.stats['files_processed']}")
+        print(f"Files not found: {self.stats['files_not_found']}")
+        print(f"Top-level categories created: {self.stats['top_labels_created']}")
+        print(f"Output directory: {self.output_root}")
+        
+        if self.top_label_articles:
+            print("\nTop-level categories:")
+            for label, articles in self.top_label_articles.items():
+                print(f"  - {label}: {len(articles)} articles")
+        print("="*50)
+    
+    def get_statistics(self) -> Dict:
+        """
+        Get organization statistics.
+        
+        Returns:
+            Dictionary containing processing statistics
+        """
+        return {
+            **self.stats,
+            'categories': {
+                label: len(articles) 
+                for label, articles in self.top_label_articles.items()
+            }
+        }
 
 
 def main():
     """
-    Main function to run the training.
+    Main function demonstrating usage of TextDataOrganizer.
     """
-    # Initialize classifier with default parameters
-    classifier = MultiLabelTextClassifier()
+    # Configuration
+    config = {
+        'annotation_file': "EN/folder2_tags.txt",
+        'text_dir': "Folder2",
+        'output_root': "classified_by_top_label"
+    }
     
-    # Run training pipeline
-    classifier.run_training_pipeline()
+    # Create organizer
+    organizer = TextDataOrganizer(**config)
+    
+    # Organize data
+    success = organizer.organize_data()
+    
+    if success:
+        # Get and display statistics
+        stats = organizer.get_statistics()
+        print(f"\nProcessing completed successfully!")
+        print(f"Check '{config['output_root']}' for organized files.")
+    else:
+        print("Data organization failed. Check logs for details.")
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
